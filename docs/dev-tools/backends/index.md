@@ -12,6 +12,7 @@ Below is a list of the available backends in mise:
 - [aqua](/dev-tools/backends/aqua)
 - [cargo](/dev-tools/backends/cargo)
 - [dotnet](/dev-tools/backends/dotnet) <Badge type="warning" text="experimental" />
+- [forgejo](/dev-tools/backends/forgejo)
 - [gem](/dev-tools/backends/gem)
 - [github](/dev-tools/backends/github)
 - [gitlab](/dev-tools/backends/gitlab)

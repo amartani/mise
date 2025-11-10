@@ -11,7 +11,7 @@ use crate::http::HTTP;
 use crate::install_context::InstallContext;
 use crate::toolset::ToolVersion;
 use crate::toolset::ToolVersionOptions;
-use crate::{backend::Backend, github, gitlab};
+use crate::{backend::Backend, forgejo, github, gitlab};
 use async_trait::async_trait;
 use eyre::Result;
 use regex::Regex;
@@ -38,6 +38,8 @@ impl Backend for UnifiedGitBackend {
     fn get_type(&self) -> BackendType {
         if self.is_gitlab() {
             BackendType::Gitlab
+        } else if self.is_forgejo() {
+            BackendType::Forgejo
         } else {
             BackendType::Github
         }
@@ -48,11 +50,22 @@ impl Backend for UnifiedGitBackend {
     }
 
     async fn _list_remote_versions(&self, _config: &Arc<Config>) -> Result<Vec<String>> {
-        let repo = self.ba.tool_name();
+        let repo = self.repo();
         let opts = self.ba.opts();
         let api_url = self.get_api_url(&opts);
         if self.is_gitlab() {
             let releases = gitlab::list_releases_from_url(api_url.as_str(), &repo).await?;
+            Ok(releases
+                .into_iter()
+                .filter(|r| {
+                    opts.get("version_prefix")
+                        .is_none_or(|p| r.tag_name.starts_with(p))
+                })
+                .map(|r| self.strip_version_prefix(&r.tag_name))
+                .rev()
+                .collect())
+        } else if self.is_forgejo() {
+            let releases = forgejo::list_releases_from_url(api_url.as_str(), &repo).await?;
             Ok(releases
                 .into_iter()
                 .filter(|r| {
@@ -139,11 +152,26 @@ impl UnifiedGitBackend {
         self.ba.backend_type() == BackendType::Gitlab
     }
 
+    fn is_forgejo(&self) -> bool {
+        self.ba.backend_type() == BackendType::Forgejo
+    }
+
     fn repo(&self) -> String {
         // Use tool_name() method to properly resolve aliases
         // This ensures that when an alias like "test-edit = github:microsoft/edit" is used,
         // the repository name is correctly extracted as "microsoft/edit"
-        self.ba.tool_name()
+        let tool_name = self.ba.tool_name();
+
+        // For Forgejo, the format is "host/owner/repo", so we need to extract "owner/repo"
+        if self.is_forgejo() {
+            // Split by '/' and skip the first part (host), then join the rest
+            let parts: Vec<&str> = tool_name.split('/').collect();
+            if parts.len() >= 3 {
+                return parts[1..].join("/");
+            }
+        }
+
+        tool_name
     }
 
     // Helper to format asset names for error messages
@@ -155,14 +183,23 @@ impl UnifiedGitBackend {
     }
 
     fn get_api_url(&self, opts: &ToolVersionOptions) -> String {
-        opts.get("api_url")
-            .map(|s| s.as_str())
-            .unwrap_or(if self.is_gitlab() {
-                DEFAULT_GITLAB_API_BASE_URL
-            } else {
-                DEFAULT_GITHUB_API_BASE_URL
-            })
-            .to_string()
+        if let Some(url) = opts.get("api_url") {
+            return url.to_string();
+        }
+
+        // For Forgejo, extract the host from the tool name (e.g., "codeberg.org" from "codeberg.org/owner/repo")
+        if self.is_forgejo() {
+            let tool_name = self.ba.tool_name();
+            if let Some(host) = tool_name.split('/').next() {
+                return format!("https://{}/api/v1", host);
+            }
+        }
+
+        if self.is_gitlab() {
+            DEFAULT_GITLAB_API_BASE_URL.to_string()
+        } else {
+            DEFAULT_GITHUB_API_BASE_URL.to_string()
+        }
     }
 
     /// Downloads and installs the asset
@@ -241,6 +278,8 @@ impl UnifiedGitBackend {
 
         let headers = if self.is_gitlab() {
             gitlab::get_headers(&url)
+        } else if self.is_forgejo() {
+            forgejo::get_headers(&url)
         } else {
             github::get_headers(&url)
         };
@@ -305,6 +344,12 @@ impl UnifiedGitBackend {
         if self.is_gitlab() {
             try_with_v_prefix(version, version_prefix, |candidate| async move {
                 self.resolve_gitlab_asset_url(tv, opts, repo, api_url, &candidate)
+                    .await
+            })
+            .await
+        } else if self.is_forgejo() {
+            try_with_v_prefix(version, version_prefix, |candidate| async move {
+                self.resolve_forgejo_asset_url(tv, opts, repo, api_url, &candidate)
                     .await
             })
             .await
@@ -440,6 +485,66 @@ impl UnifiedGitBackend {
             url: asset.direct_asset_url.clone(),
             url_api: asset.url.clone(),
             digest: None, // GitLab doesn't provide digests yet
+        })
+    }
+
+    async fn resolve_forgejo_asset_url(
+        &self,
+        tv: &ToolVersion,
+        opts: &ToolVersionOptions,
+        repo: &str,
+        api_url: &str,
+        version: &str,
+    ) -> Result<ReleaseAsset> {
+        let release = forgejo::get_release_for_url(api_url, repo, version).await?;
+
+        let available_assets: Vec<String> = release.assets.iter().map(|a| a.name.clone()).collect();
+
+        // Try explicit pattern first, then fall back to auto-detection
+        if let Some(pattern) = lookup_platform_key(opts, "asset_pattern")
+            .or_else(|| opts.get("asset_pattern").cloned())
+        {
+            // Template the pattern with actual values
+            let templated_pattern = template_string(&pattern, tv);
+
+            // Find matching asset using pattern
+            let asset = release
+                .assets
+                .into_iter()
+                .find(|a| self.matches_pattern(&a.name, &templated_pattern))
+                .ok_or_else(|| {
+                    eyre::eyre!(
+                        "No matching asset found for pattern: {}\nAvailable assets: {}",
+                        templated_pattern,
+                        Self::format_asset_list(available_assets.iter())
+                    )
+                })?;
+
+            return Ok(ReleaseAsset {
+                name: asset.name,
+                url: asset.browser_download_url.clone(),
+                url_api: asset.browser_download_url,
+                digest: None,
+            });
+        }
+
+        // Fall back to auto-detection
+        let asset_name = self.auto_detect_asset(&available_assets)?;
+        let asset = self
+            .find_asset_case_insensitive(&release.assets, &asset_name, |a| &a.name)
+            .ok_or_else(|| {
+                eyre::eyre!(
+                    "Auto-detected asset not found: {}\nAvailable assets: {}",
+                    asset_name,
+                    Self::format_asset_list(available_assets.iter())
+                )
+            })?;
+
+        Ok(ReleaseAsset {
+            name: asset.name.clone(),
+            url: asset.browser_download_url.clone(),
+            url_api: asset.browser_download_url.clone(),
+            digest: None,
         })
     }
 
