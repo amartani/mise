@@ -2,8 +2,8 @@ use crate::cache::{CacheManager, CacheManagerBuilder};
 use crate::{dirs, duration, env};
 use eyre::Result;
 use heck::ToKebabCase;
-use reqwest::IntoUrl;
 use reqwest::header::{HeaderMap, HeaderValue};
+use reqwest::IntoUrl;
 use serde_derive::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -13,26 +13,21 @@ use tokio::sync::RwLockReadGuard;
 use xx::regex;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GithubRelease {
+pub struct ForgeRelease {
     pub tag_name: String,
-    // pub name: Option<String>,
-    // pub body: Option<String>,
     pub draft: bool,
     pub prerelease: bool,
-    // pub created_at: String,
-    // pub published_at: Option<String>,
-    pub assets: Vec<GithubAsset>,
+    pub assets: Vec<ForgeAsset>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GithubTag {
+pub struct ForgeTag {
     pub name: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GithubAsset {
+pub struct ForgeAsset {
     pub name: String,
-    // pub size: u64,
     pub browser_download_url: String,
     #[serde(default)]
     pub url: Option<String>,
@@ -40,13 +35,9 @@ pub struct GithubAsset {
 
 type CacheGroup<T> = HashMap<String, CacheManager<T>>;
 
-static RELEASES_CACHE: Lazy<RwLock<CacheGroup<Vec<GithubRelease>>>> = Lazy::new(Default::default);
-
-static RELEASE_CACHE: Lazy<RwLock<CacheGroup<GithubRelease>>> = Lazy::new(Default::default);
-
+static RELEASES_CACHE: Lazy<RwLock<CacheGroup<Vec<ForgeRelease>>>> = Lazy::new(Default::default);
+static RELEASE_CACHE: Lazy<RwLock<CacheGroup<ForgeRelease>>> = Lazy::new(Default::default);
 static TAGS_CACHE: Lazy<RwLock<CacheGroup<Vec<String>>>> = Lazy::new(Default::default);
-
-pub static API_URL: &str = "https://api.github.com";
 
 async fn get_tags_cache(key: &str) -> RwLockReadGuard<'_, CacheGroup<Vec<String>>> {
     TAGS_CACHE
@@ -61,7 +52,7 @@ async fn get_tags_cache(key: &str) -> RwLockReadGuard<'_, CacheGroup<Vec<String>
     TAGS_CACHE.read().await
 }
 
-async fn get_releases_cache(key: &str) -> RwLockReadGuard<'_, CacheGroup<Vec<GithubRelease>>> {
+async fn get_releases_cache(key: &str) -> RwLockReadGuard<'_, CacheGroup<Vec<ForgeRelease>>> {
     RELEASES_CACHE
         .write()
         .await
@@ -74,7 +65,7 @@ async fn get_releases_cache(key: &str) -> RwLockReadGuard<'_, CacheGroup<Vec<Git
     RELEASES_CACHE.read().await
 }
 
-async fn get_release_cache<'a>(key: &str) -> RwLockReadGuard<'a, CacheGroup<GithubRelease>> {
+async fn get_release_cache<'a>(key: &str) -> RwLockReadGuard<'a, CacheGroup<ForgeRelease>> {
     RELEASE_CACHE
         .write()
         .await
@@ -87,17 +78,7 @@ async fn get_release_cache<'a>(key: &str) -> RwLockReadGuard<'a, CacheGroup<Gith
     RELEASE_CACHE.read().await
 }
 
-pub async fn list_releases(repo: &str) -> Result<Vec<GithubRelease>> {
-    let key = repo.to_kebab_case();
-    let cache = get_releases_cache(&key).await;
-    let cache = cache.get(&key).unwrap();
-    Ok(cache
-        .get_or_try_init_async(async || list_releases_(API_URL, repo).await)
-        .await?
-        .to_vec())
-}
-
-pub async fn list_releases_from_url(api_url: &str, repo: &str) -> Result<Vec<GithubRelease>> {
+pub async fn list_releases_from_url(api_url: &str, repo: &str) -> Result<Vec<ForgeRelease>> {
     let key = format!("{api_url}-{repo}").to_kebab_case();
     let cache = get_releases_cache(&key).await;
     let cache = cache.get(&key).unwrap();
@@ -107,18 +88,18 @@ pub async fn list_releases_from_url(api_url: &str, repo: &str) -> Result<Vec<Git
         .to_vec())
 }
 
-async fn list_releases_(api_url: &str, repo: &str) -> Result<Vec<GithubRelease>> {
+async fn list_releases_(api_url: &str, repo: &str) -> Result<Vec<ForgeRelease>> {
     let url = format!("{api_url}/repos/{repo}/releases");
     let headers = get_headers(&url);
     let (mut releases, mut headers) = crate::http::HTTP_FETCH
-        .json_headers_with_headers::<Vec<GithubRelease>, _>(url, &headers)
+        .json_headers_with_headers::<Vec<ForgeRelease>, _>(url, &headers)
         .await?;
 
     if *env::MISE_LIST_ALL_VERSIONS {
         while let Some(next) = next_page(&headers) {
             headers = get_headers(&next);
             let (more, h) = crate::http::HTTP_FETCH
-                .json_headers_with_headers::<Vec<GithubRelease>, _>(next, &headers)
+                .json_headers_with_headers::<Vec<ForgeRelease>, _>(next, &headers)
                 .await?;
             releases.extend(more);
             headers = h;
@@ -127,16 +108,6 @@ async fn list_releases_(api_url: &str, repo: &str) -> Result<Vec<GithubRelease>>
     releases.retain(|r| !r.draft && !r.prerelease);
 
     Ok(releases)
-}
-
-pub async fn list_tags(repo: &str) -> Result<Vec<String>> {
-    let key = repo.to_kebab_case();
-    let cache = get_tags_cache(&key).await;
-    let cache = cache.get(&key).unwrap();
-    Ok(cache
-        .get_or_try_init_async(async || list_tags_(API_URL, repo).await)
-        .await?
-        .to_vec())
 }
 
 pub async fn list_tags_from_url(api_url: &str, repo: &str) -> Result<Vec<String>> {
@@ -153,14 +124,14 @@ async fn list_tags_(api_url: &str, repo: &str) -> Result<Vec<String>> {
     let url = format!("{api_url}/repos/{repo}/tags");
     let headers = get_headers(&url);
     let (mut tags, mut headers) = crate::http::HTTP_FETCH
-        .json_headers_with_headers::<Vec<GithubTag>, _>(url, &headers)
+        .json_headers_with_headers::<Vec<ForgeTag>, _>(url, &headers)
         .await?;
 
     if *env::MISE_LIST_ALL_VERSIONS {
         while let Some(next) = next_page(&headers) {
             headers = get_headers(&next);
             let (more, h) = crate::http::HTTP_FETCH
-                .json_headers_with_headers::<Vec<GithubTag>, _>(next, &headers)
+                .json_headers_with_headers::<Vec<ForgeTag>, _>(next, &headers)
                 .await?;
             tags.extend(more);
             headers = h;
@@ -170,17 +141,7 @@ async fn list_tags_(api_url: &str, repo: &str) -> Result<Vec<String>> {
     Ok(tags.into_iter().map(|t| t.name).collect())
 }
 
-pub async fn get_release(repo: &str, tag: &str) -> Result<GithubRelease> {
-    let key = format!("{repo}-{tag}").to_kebab_case();
-    let cache = get_release_cache(&key).await;
-    let cache = cache.get(&key).unwrap();
-    Ok(cache
-        .get_or_try_init_async(async || get_release_(API_URL, repo, tag).await)
-        .await?
-        .clone())
-}
-
-pub async fn get_release_for_url(api_url: &str, repo: &str, tag: &str) -> Result<GithubRelease> {
+pub async fn get_release_for_url(api_url: &str, repo: &str, tag: &str) -> Result<ForgeRelease> {
     let key = format!("{api_url}-{repo}-{tag}").to_kebab_case();
     let cache = get_release_cache(&key).await;
     let cache = cache.get(&key).unwrap();
@@ -190,7 +151,7 @@ pub async fn get_release_for_url(api_url: &str, repo: &str, tag: &str) -> Result
         .clone())
 }
 
-async fn get_release_(api_url: &str, repo: &str, tag: &str) -> Result<GithubRelease> {
+async fn get_release_(api_url: &str, repo: &str, tag: &str) -> Result<ForgeRelease> {
     let url = format!("{api_url}/repos/{repo}/releases/tags/{tag}");
     let headers = get_headers(&url);
     crate::http::HTTP_FETCH
@@ -209,7 +170,7 @@ fn next_page(headers: &HeaderMap) -> Option<String> {
 }
 
 fn cache_dir() -> PathBuf {
-    dirs::CACHE.join("github")
+    dirs::CACHE.join("forge")
 }
 
 pub fn get_headers<U: IntoUrl>(url: U) -> HeaderMap {
@@ -219,10 +180,6 @@ pub fn get_headers<U: IntoUrl>(url: U) -> HeaderMap {
         headers.insert(
             "authorization",
             HeaderValue::from_str(format!("token {token}").as_str()).unwrap(),
-        );
-        headers.insert(
-            "x-github-api-version",
-            HeaderValue::from_static("2022-11-28"),
         );
     };
 

@@ -12,15 +12,15 @@ use crate::install_context::InstallContext;
 use crate::toolset::ToolVersion;
 use crate::toolset::ToolVersionOptions;
 use crate::backend::{forge, Backend};
-use crate::gitlab;
 use async_trait::async_trait;
 use eyre::Result;
 use regex::Regex;
 use std::fmt::Debug;
 use std::sync::Arc;
+use url::Url;
 
 #[derive(Debug)]
-pub struct UnifiedGitBackend {
+pub struct ForgejoBackend {
     ba: Arc<BackendArg>,
 }
 
@@ -31,13 +31,9 @@ struct ReleaseAsset {
 }
 
 #[async_trait]
-impl Backend for UnifiedGitBackend {
+impl Backend for ForgejoBackend {
     fn get_type(&self) -> BackendType {
-        if self.is_gitlab() {
-            BackendType::Gitlab
-        } else {
-            BackendType::Github
-        }
+        BackendType::Forgejo
     }
 
     fn ba(&self) -> &Arc<BackendArg> {
@@ -45,32 +41,19 @@ impl Backend for UnifiedGitBackend {
     }
 
     async fn _list_remote_versions(&self, _config: &Arc<Config>) -> Result<Vec<String>> {
-        let repo = self.ba.tool_name();
+        let repo = self.repo();
         let opts = self.ba.opts();
-        let api_url = self.get_api_url(&opts);
-        if self.is_gitlab() {
-            let releases = gitlab::list_releases_from_url(api_url.as_str(), &repo).await?;
-            Ok(releases
-                .into_iter()
-                .filter(|r| {
-                    opts.get("version_prefix")
-                        .is_none_or(|p| r.tag_name.starts_with(p))
-                })
-                .map(|r| self.strip_version_prefix(&r.tag_name))
-                .rev()
-                .collect())
-        } else {
-            let releases = forge::list_releases_from_url(api_url.as_str(), &repo).await?;
-            Ok(releases
-                .into_iter()
-                .filter(|r| {
-                    opts.get("version_prefix")
-                        .is_none_or(|p| r.tag_name.starts_with(p))
-                })
-                .map(|r| self.strip_version_prefix(&r.tag_name))
-                .rev()
-                .collect())
-        }
+        let api_url = self.get_api_url(&opts)?;
+        let releases = forge::list_releases_from_url(api_url.as_str(), &repo).await?;
+        Ok(releases
+            .into_iter()
+            .filter(|r| {
+                opts.get("version_prefix")
+                    .is_none_or(|p| r.tag_name.starts_with(p))
+            })
+            .map(|r| self.strip_version_prefix(&r.tag_name))
+            .rev()
+            .collect())
     }
 
     async fn install_version_(
@@ -80,7 +63,7 @@ impl Backend for UnifiedGitBackend {
     ) -> Result<ToolVersion> {
         let repo = self.repo();
         let opts = tv.request.options();
-        let api_url = self.get_api_url(&opts);
+        let api_url = self.get_api_url(&opts)?;
 
         let platform_key = self.get_platform_key();
         let asset = if let Some(existing_platform) = tv.lock_platforms.get(&platform_key) {
@@ -121,17 +104,15 @@ impl Backend for UnifiedGitBackend {
     }
 }
 
-impl UnifiedGitBackend {
+impl ForgejoBackend {
     pub fn from_arg(ba: BackendArg) -> Self {
         Self { ba: Arc::new(ba) }
     }
 
-    fn is_gitlab(&self) -> bool {
-        self.ba.backend_type() == BackendType::Gitlab
-    }
-
     fn repo(&self) -> String {
-        self.ba.tool_name()
+        let repo = self.ba.tool_name();
+        let repo = repo.split('/').skip(1).collect::<Vec<_>>().join("/");
+        repo
     }
 
     fn format_asset_list<'a, I>(assets: I) -> String
@@ -141,15 +122,14 @@ impl UnifiedGitBackend {
         assets.cloned().collect::<Vec<_>>().join(", ")
     }
 
-    fn get_api_url(&self, opts: &ToolVersionOptions) -> String {
-        opts.get("api_url")
-            .map(|s| s.as_str())
-            .unwrap_or(if self.is_gitlab() {
-                "https://gitlab.com/api/v4"
-            } else {
-                "https://api.github.com"
-            })
-            .to_string()
+    fn get_api_url(&self, opts: &ToolVersionOptions) -> Result<String> {
+        if let Some(api_url) = opts.get("api_url") {
+            return Ok(api_url.clone());
+        }
+        let full_repo = self.ba.tool_name();
+        let host = full_repo.split('/').next().unwrap();
+        let url = Url::parse(&format!("https://{host}"))?;
+        Ok(format!("{}api/v1", url))
     }
 
     async fn download_and_install(
@@ -196,11 +176,7 @@ impl UnifiedGitBackend {
             Err(_) => asset.url_api.clone(),
         };
 
-        let headers = if self.is_gitlab() {
-            gitlab::get_headers(&url)
-        } else {
-            forge::get_headers(&url)
-        };
+        let headers = forge::get_headers(&url);
 
         ctx.pr.set_message(format!("download {filename}"));
         HTTP.download_file_with_headers(url, &file_path, &headers, Some(ctx.pr.as_ref()))
@@ -253,22 +229,14 @@ impl UnifiedGitBackend {
 
         let version = &tv.version;
         let version_prefix = opts.get("version_prefix").map(|s| s.as_str());
-        if self.is_gitlab() {
-            try_with_v_prefix(version, version_prefix, |candidate| async move {
-                self.resolve_gitlab_asset_url(tv, opts, repo, api_url, &candidate)
-                    .await
-            })
-            .await
-        } else {
-            try_with_v_prefix(version, version_prefix, |candidate| async move {
-                self.resolve_github_asset_url(tv, opts, repo, api_url, &candidate)
-                    .await
-            })
-            .await
-        }
+        try_with_v_prefix(version, version_prefix, |candidate| async move {
+            self.resolve_forge_asset_url(tv, opts, repo, api_url, &candidate)
+                .await
+        })
+        .await
     }
 
-    async fn resolve_github_asset_url(
+    async fn resolve_forge_asset_url(
         &self,
         tv: &ToolVersion,
         opts: &ToolVersionOptions,
@@ -299,10 +267,8 @@ impl UnifiedGitBackend {
 
             return Ok(ReleaseAsset {
                 name: asset.name,
-                url: asset.browser_download_url.clone(),
-                url_api: asset
-                    .url
-                    .unwrap_or_else(|| asset.browser_download_url.clone()),
+                url: asset.browser_download_url,
+                url_api: asset.url.unwrap_or_default(),
             });
         }
 
@@ -320,72 +286,10 @@ impl UnifiedGitBackend {
         Ok(ReleaseAsset {
             name: asset.name.clone(),
             url: asset.browser_download_url.clone(),
-            url_api: asset
-                .url
-                .clone()
-                .unwrap_or_else(|| asset.browser_download_url.clone()),
+            url_api: asset.url.clone().unwrap_or_default(),
         })
     }
 
-    async fn resolve_gitlab_asset_url(
-        &self,
-        tv: &ToolVersion,
-        opts: &ToolVersionOptions,
-        repo: &str,
-        api_url: &str,
-        version: &str,
-    ) -> Result<ReleaseAsset> {
-        let release = gitlab::get_release_for_url(api_url, repo, version).await?;
-
-        let available_assets: Vec<String> = release
-            .assets
-            .links
-            .iter()
-            .map(|a| a.name.clone())
-            .collect();
-
-        if let Some(pattern) = lookup_platform_key(opts, "asset_pattern")
-            .or_else(|| opts.get("asset_pattern").cloned())
-        {
-            let templated_pattern = template_string(&pattern, tv);
-
-            let asset = release
-                .assets
-                .links
-                .into_iter()
-                .find(|a| self.matches_pattern(&a.name, &templated_pattern))
-                .ok_or_else(|| {
-                    eyre::eyre!(
-                        "No matching asset found for pattern: {}\nAvailable assets: {}",
-                        templated_pattern,
-                        Self::format_asset_list(available_assets.iter())
-                    )
-                })?;
-
-            return Ok(ReleaseAsset {
-                name: asset.name,
-                url: asset.url,
-                url_api: asset.direct_asset_url,
-            });
-        }
-
-        let asset_name = self.auto_detect_asset(&available_assets)?;
-        let asset = self
-            .find_asset_case_insensitive(&release.assets.links, &asset_name, |a| &a.name)
-            .ok_or_else(|| {
-                eyre::eyre!(
-                    "Auto-detected asset not found: {}\nAvailable assets: {}",
-                    asset_name,
-                    Self::format_asset_list(available_assets.iter())
-                )
-            })?;
-
-        Ok(ReleaseAsset {
-            name: asset.name.clone(),
-            url: asset.direct_asset_url.clone(),
-            url_api: asset.url.clone(),
-        })
-    }
 
     fn auto_detect_asset(&self, available_assets: &[String]) -> Result<String> {
         let settings = Settings::get();
@@ -456,10 +360,10 @@ mod tests {
     use super::*;
     use crate::cli::args::BackendArg;
 
-    fn create_test_backend() -> UnifiedGitBackend {
-        UnifiedGitBackend::from_arg(BackendArg::new(
-            "github".to_string(),
-            Some("github:test/repo".to_string()),
+    fn create_test_backend() -> ForgejoBackend {
+        ForgejoBackend::from_arg(BackendArg::new(
+            "forgejo".to_string(),
+            Some("forgejo:codeberg.org/mergiraf/mergiraf".to_string()),
         ))
     }
 
@@ -482,7 +386,7 @@ mod tests {
             .insert("version_prefix".to_string(), "release-".to_string());
         backend.ba = Arc::new(BackendArg::new_raw(
             "test".to_string(),
-            Some("github:test/repo".to_string()),
+            Some("forgejo:codeberg.org/mergiraf/mergiraf".to_string()),
             "test".to_string(),
             Some(opts),
         ));
