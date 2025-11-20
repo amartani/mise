@@ -175,6 +175,7 @@ pub fn arg_to_backend(ba: BackendArg) -> Option<ABackend> {
         BackendType::Dotnet => Some(Arc::new(dotnet::DotnetBackend::from_arg(ba))),
         BackendType::Npm => Some(Arc::new(npm::NPMBackend::from_arg(ba))),
         BackendType::Gem => Some(Arc::new(gem::GemBackend::from_arg(ba))),
+        BackendType::Forgejo => Some(Arc::new(github::UnifiedGitBackend::from_arg(ba))),
         BackendType::Github => Some(Arc::new(github::UnifiedGitBackend::from_arg(ba))),
         BackendType::Gitlab => Some(Arc::new(github::UnifiedGitBackend::from_arg(ba))),
         BackendType::Go => Some(Arc::new(go::GoBackend::from_arg(ba))),
