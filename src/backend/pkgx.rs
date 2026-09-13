@@ -13,10 +13,10 @@ use crate::{backend::Backend, file};
 use async_trait::async_trait;
 use eyre::{Result, WrapErr, bail};
 use indexmap::IndexMap;
+use libsemverator::semver::Semver as PkgxVersion;
 use nodejs_semver::{Range, Version as NodeVersion};
 use serde::Deserialize;
 use serde_yaml::{Mapping, Value};
-use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::fmt::Debug;
 use std::fs;
@@ -626,136 +626,23 @@ fn max_pkgx_version<'a>(version_strings: &[&'a str]) -> Option<&'a str> {
 }
 
 fn is_greater_pkgx_version(candidate: &str, current: &str) -> bool {
-    match (pkgx_version_key(candidate), pkgx_version_key(current)) {
-        (Some(a), Some(b)) => cmp_pkgx_keys(&a, &b) == Ordering::Greater,
+    match (parse_pkgx_version(candidate), parse_pkgx_version(current)) {
+        (Some(a), Some(b)) => a > b,
         // Parseable versions outrank unparseable ones.
         (Some(_), None) => true,
         _ => false,
     }
 }
 
-/// Sort key for a pkgx version, mirroring semverator's `Semver` (which ports
-/// pkgx's `libpkgx:utils/semver.ts`): numeric components of any length, with
-/// an optional single trailing lowercase letter (`a`=1 … `z`=26) as an extra
-/// component, so `1.1.1w` is `[1, 1, 1, 23]`.
-struct PkgxVersionKey {
-    components: Vec<u64>,
-    prerelease: Option<String>,
-    build: Option<String>,
-}
-
-fn pkgx_version_key(version: &str) -> Option<PkgxVersionKey> {
-    let v = version.trim().trim_start_matches(['v', 'V']);
-    let (core, meta) = match v.find(['-', '+']) {
-        Some(i) => (&v[..i], Some(&v[i..])),
-        None => (v, None),
-    };
-    let mut numeric_end = 0;
-    for (i, c) in core.char_indices() {
-        if c.is_ascii_digit() || c == '.' {
-            numeric_end = i + c.len_utf8();
-        } else {
-            break;
-        }
-    }
-    let (numeric, rest) = (&core[..numeric_end], &core[numeric_end..]);
-    if numeric.is_empty() || !numeric.ends_with(|c: char| c.is_ascii_digit()) {
-        return None;
-    }
-    let mut components: Vec<u64> = numeric
-        .split('.')
-        .map(str::parse)
-        .collect::<Result<_, _>>()
-        .ok()?;
-    // Only a single trailing lowercase letter carries ordering, matching
-    // semverator's `([a-z])?`. Anything else after the numerics must be
-    // prerelease/build metadata.
-    let (letter, trailing) = match rest.chars().next() {
-        Some(c) if c.is_ascii_lowercase() && rest.len() == c.len_utf8() => {
-            (Some(u64::from(c as u8 - b'a' + 1)), "")
-        }
-        _ => (None, rest),
-    };
-    if let Some(letter) = letter {
-        components.push(letter);
-    }
-    if !trailing.is_empty() {
-        return None;
-    }
-    let (prerelease, build) = match meta {
-        None => (None, None),
-        Some(meta) => {
-            let build_only = meta.starts_with('+');
-            let rest = &meta[1..];
-            if rest.is_empty() {
-                return None;
-            }
-            if build_only {
-                (None, Some(rest.to_string()))
-            } else {
-                match rest.split_once('+') {
-                    Some((pre, build)) => (Some(pre.to_string()), Some(build.to_string())),
-                    None => (Some(rest.to_string()), None),
-                }
-            }
-        }
-    };
-    Some(PkgxVersionKey {
-        components,
-        prerelease,
-        build,
-    })
-}
-
-/// Compare two version keys mirroring semverator's ordering: components with
-/// missing parts as 0, then release > prerelease, then identifier-wise string
-/// comparison of prerelease and build metadata.
-fn cmp_pkgx_keys(left: &PkgxVersionKey, right: &PkgxVersionKey) -> Ordering {
-    let len = left.components.len().max(right.components.len());
-    for i in 0..len {
-        let a = left.components.get(i).copied().unwrap_or(0);
-        let b = right.components.get(i).copied().unwrap_or(0);
-        match a.cmp(&b) {
-            Ordering::Equal => {}
-            ord => return ord,
-        }
-    }
-    match cmp_pkgx_meta(&left.prerelease, &right.prerelease) {
-        Ordering::Equal => {}
-        ord => return ord,
-    }
-    match cmp_pkgx_meta(&left.build, &right.build) {
-        Ordering::Equal => {}
-        ord => return ord,
-    }
-    Ordering::Equal
-}
-
-/// Release (no metadata) outranks metadata; otherwise compare
-/// dot-separated identifiers as strings, with a missing identifier sorting
-/// below a present one — mirroring semverator's `compare`.
-fn cmp_pkgx_meta(left: &Option<String>, right: &Option<String>) -> Ordering {
-    match (left, right) {
-        (None, None) => Ordering::Equal,
-        (None, Some(_)) => Ordering::Greater,
-        (Some(_), None) => Ordering::Less,
-        (Some(a), Some(b)) => {
-            let a: Vec<&str> = a.split('.').collect();
-            let b: Vec<&str> = b.split('.').collect();
-            let len = a.len().max(b.len());
-            for i in 0..len {
-                match (a.get(i), b.get(i)) {
-                    (None, _) => return Ordering::Less,
-                    (_, None) => return Ordering::Greater,
-                    (Some(x), Some(y)) => match x.cmp(y) {
-                        Ordering::Equal => {}
-                        ord => return ord,
-                    },
-                }
-            }
-            Ordering::Equal
-        }
-    }
+/// Parse a pkgx version with semverator (the Rust port of pkgx's
+/// `libpkgx:utils/semver.ts`): numeric components of any length, with an
+/// optional single trailing lowercase letter (`a`=1 … `z`=26) as an extra
+/// component, so `1.1.1w` is `[1, 1, 1, 23]`. Ordering (including prerelease,
+/// build, and calver handling) comes from its `Ord` impl.
+fn parse_pkgx_version(version: &str) -> Option<PkgxVersion> {
+    // semverator strips a lowercase `v` itself; also tolerate surrounding
+    // whitespace and an uppercase `V` for `versions.txt` robustness.
+    PkgxVersion::parse(version.trim().trim_start_matches(['v', 'V'])).ok()
 }
 
 async fn list_pkg_versions(name: &str) -> Result<Vec<VersionInfo>> {
@@ -1499,35 +1386,45 @@ dependencies:
 
     #[test]
     fn pkgx_version_key_maps_trailing_letter() {
-        // Mirrors semverator: `1.1.1q` is `[1, 1, 1, 17]`.
+        // semverator parses `1.1.1q` as components `[1, 1, 1, 17]`.
         assert_eq!(
-            pkgx_version_key("1.1.1w").unwrap().components,
+            parse_pkgx_version("1.1.1w").unwrap().components,
             vec![1, 1, 1, 23]
         );
         assert_eq!(
-            pkgx_version_key("1.1.1q").unwrap().components,
+            parse_pkgx_version("1.1.1q").unwrap().components,
             vec![1, 1, 1, 17]
         );
         assert_eq!(
-            pkgx_version_key("v1.1.1w").unwrap().components,
+            parse_pkgx_version("v1.1.1w").unwrap().components,
             vec![1, 1, 1, 23]
         );
-        assert_eq!(pkgx_version_key("1.1").unwrap().components, vec![1, 1]);
-        assert_eq!(pkgx_version_key("1.1.1").unwrap().components, vec![1, 1, 1]);
-        assert!(pkgx_version_key("latest").is_none());
-        assert!(pkgx_version_key("").is_none());
+        // Uppercase `V` is tolerated by our wrapper, not by the library.
+        assert_eq!(
+            parse_pkgx_version("V1.1.1w").unwrap().components,
+            vec![1, 1, 1, 23]
+        );
+        assert_eq!(parse_pkgx_version("1.1").unwrap().components, vec![1, 1]);
+        assert_eq!(
+            parse_pkgx_version("1.1.1").unwrap().components,
+            vec![1, 1, 1]
+        );
+        assert!(parse_pkgx_version("latest").is_none());
+        assert!(parse_pkgx_version("").is_none());
         // Only a single trailing lowercase letter carries ordering,
         // matching semverator's `([a-z])?`.
-        assert!(pkgx_version_key("1.1.1W").is_none());
-        assert!(pkgx_version_key("1.1.1ab").is_none());
-        assert!(pkgx_version_key("3.12.0a1").is_none());
+        assert!(parse_pkgx_version("1.1.1W").is_none());
+        assert!(parse_pkgx_version("1.1.1ab").is_none());
+        assert!(parse_pkgx_version("3.12.0a1").is_none());
     }
 
     #[test]
     fn compares_pkgx_versions_like_semverator() {
         use std::cmp::Ordering;
         let cmp = |a: &str, b: &str| {
-            cmp_pkgx_keys(&pkgx_version_key(a).unwrap(), &pkgx_version_key(b).unwrap())
+            parse_pkgx_version(a)
+                .unwrap()
+                .cmp(&parse_pkgx_version(b).unwrap())
         };
         assert_eq!(cmp("1.1.1q", "1.1.1w"), Ordering::Less);
         assert_eq!(cmp("1.1.1w", "1.1.1q"), Ordering::Greater);

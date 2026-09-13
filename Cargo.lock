@@ -6217,6 +6217,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "libsemverator"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0137cc8af7cd9ca1f70daa2a2320a9809d822dcf55f8cc3adebe60f4729f7844"
+dependencies = [
+ "lazy_static",
+ "regex",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "libyaml-rs"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6598,6 +6609,7 @@ dependencies = [
  "jiff",
  "junction",
  "landlock",
+ "libsemverator",
  "log",
  "md-5 0.11.0",
  "miette",
