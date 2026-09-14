@@ -13,6 +13,7 @@ use crate::{backend::Backend, file};
 use async_trait::async_trait;
 use eyre::{Result, WrapErr, bail};
 use indexmap::IndexMap;
+use libsemverator::semver::Semver as PkgxVersion;
 use nodejs_semver::{Range, Version as NodeVersion};
 use serde::Deserialize;
 use serde_yaml::{Mapping, Value};
@@ -411,19 +412,19 @@ async fn resolve_version(name: &str, requirement: &str, target: &PlatformTarget)
 
     let range = parse_requirement_range(name, requirement)?;
 
-    version_strings
-        .iter()
-        .rev()
-        .find(|version| semver_satisfies(version, &range))
-        .map(|version| (*version).to_string())
+    max_satisfying_version(&version_strings, &range)
+        .map(|version| version.to_string())
         .ok_or_else(|| eyre::eyre!("no pkgx version for {name} satisfies {requirement}"))
 }
 
 async fn latest_version(name: &str, target: &PlatformTarget) -> Result<String> {
-    list_pkg_versions_for_target(name, target)
-        .await?
-        .last()
-        .map(|v| v.version.clone())
+    let versions = list_pkg_versions_for_target(name, target).await?;
+    let version_strings = versions
+        .iter()
+        .map(|v| v.version.as_str())
+        .collect::<Vec<_>>();
+    max_pkgx_version(&version_strings)
+        .map(|version| version.to_string())
         .ok_or_else(|| eyre::eyre!("no pkgx versions found for {name}"))
 }
 
@@ -467,7 +468,26 @@ fn is_any_requirement(requirement: &str) -> bool {
     requirement.is_empty() || requirement == "*" || requirement.eq_ignore_ascii_case("latest")
 }
 
+/// Parse a pkgx version requirement into a semver range, coercing
+/// letter-suffixed bounds first: `<=1.1.1q` parses as a prerelease range
+/// that would wrongly reject the coerced release form, so the coerced parse
+/// is preferred whenever coercion changes the input.
 fn parse_requirement_range(name: &str, requirement: &str) -> Result<Range> {
+    let coerced = coerce_requirement_versions(requirement);
+    if coerced != requirement {
+        if let Ok(range) = Range::parse(&coerced) {
+            return Ok(range);
+        }
+        if let Ok(range) = Range::parse(format!("{coerced}.x")) {
+            return Ok(range);
+        }
+    }
+    if let Ok(range) = Range::parse(requirement) {
+        return Ok(range);
+    }
+    if let Ok(range) = Range::parse(format!("{requirement}.x")) {
+        return Ok(range);
+    }
     Range::parse(requirement)
         .or_else(|_| Range::parse(format!("{requirement}.x")))
         .wrap_err_with(|| {
@@ -475,10 +495,157 @@ fn parse_requirement_range(name: &str, requirement: &str) -> Result<Range> {
         })
 }
 
+/// Check a pkgx version against a range, also trying the coerced
+/// (letter-stripped) form since trailing letters are patch-level releases,
+/// not prereleases, and otherwise never match a plain range like `^1.0.1`.
 fn semver_satisfies(version: &str, range: &Range) -> bool {
-    NodeVersion::parse(version)
-        .or_else(|_| NodeVersion::parse(version.trim_start_matches(['v', 'V'])))
-        .is_ok_and(|version| range.satisfies(&version))
+    if NodeVersion::parse(version).is_ok_and(|parsed| range.satisfies(&parsed)) {
+        return true;
+    }
+    if NodeVersion::parse(version.trim_start_matches(['v', 'V']))
+        .is_ok_and(|parsed| range.satisfies(&parsed))
+    {
+        return true;
+    }
+    if let Some(coerced) = coerce_pkgx_version(version)
+        && NodeVersion::parse(&coerced).is_ok_and(|parsed| range.satisfies(&parsed))
+    {
+        return true;
+    }
+    false
+}
+
+/// Coerce pkgx versions with trailing-letter suffixes (e.g. openssl `1.1.1w`)
+/// into plain semver (`1.1.1`) for range comparison.
+///
+/// The original string is still used for bottle URLs; this is only for
+/// `Range::satisfies` checks, where the letter suffix would otherwise parse
+/// as a prerelease and never match a plain range like `^1.0.1`.
+fn coerce_pkgx_version(version: &str) -> Option<String> {
+    let v = version.trim().trim_start_matches(['v', 'V']);
+    let split = v.find(['-', '+']);
+    let (core, suffix) = match split {
+        Some(i) => (&v[..i], &v[i..]),
+        None => (v, ""),
+    };
+    let mut numeric_end = 0;
+    for (i, c) in core.char_indices() {
+        if c.is_ascii_digit() || c == '.' {
+            numeric_end = i + c.len_utf8();
+        } else {
+            break;
+        }
+    }
+    let (numeric, rest) = (&core[..numeric_end], &core[numeric_end..]);
+    if numeric.is_empty() || rest.is_empty() {
+        return None;
+    }
+    if !rest.starts_with(|c: char| c.is_ascii_alphabetic()) {
+        return None;
+    }
+    if !numeric.ends_with(|c: char| c.is_ascii_digit()) {
+        return None;
+    }
+    // OpenSSL-style suffixes are pure letters ("1.1.1w"). Leave prerelease
+    // style suffixes with digits ("3.12.0a1", "8p1") alone so prerelease
+    // semantics are preserved.
+    if !rest.chars().all(|c| c.is_ascii_alphabetic()) {
+        return None;
+    }
+    Some(format!("{numeric}{suffix}"))
+}
+
+/// Strip trailing-letter suffixes from versions embedded in a requirement
+/// string so `Range::parse` can handle e.g. `>=1.1.1q`.
+fn coerce_requirement_versions(requirement: &str) -> String {
+    let bytes = requirement.as_bytes();
+    let mut out = String::with_capacity(requirement.len());
+    let mut i = 0;
+    while i < requirement.len() {
+        if bytes[i].is_ascii_digit() {
+            let start = i;
+            while i < requirement.len() && (bytes[i].is_ascii_digit() || bytes[i] == b'.') {
+                i += 1;
+            }
+            let rest_start = i;
+            while i < requirement.len() && bytes[i].is_ascii_alphabetic() {
+                i += 1;
+            }
+            // Only strip pure-letter suffixes ("1.1.1w"); if a digit follows
+            // the letters ("3.12.0a1") leave the token untouched so
+            // prerelease semantics are preserved.
+            if i > rest_start && (i >= requirement.len() || !bytes[i].is_ascii_digit()) {
+                out.push_str(&requirement[start..rest_start]);
+            } else {
+                // Emit the scanned token verbatim, including any trailing
+                // digits of suffixes like `a1`/`p1`.
+                while i < requirement.len() && bytes[i].is_ascii_digit() {
+                    i += 1;
+                }
+                out.push_str(&requirement[start..i]);
+            }
+        } else {
+            out.push(bytes[i] as char);
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Pick the highest version satisfying `range`, comparing with pkgx
+/// (semverator) ordering rather than `versions.txt` position, so e.g.
+/// `1.1.1w` wins over `1.1.1s` regardless of list order.
+fn max_satisfying_version<'a>(version_strings: &[&'a str], range: &Range) -> Option<&'a str> {
+    let mut best: Option<&'a str> = None;
+    for version in version_strings {
+        if !semver_satisfies(version, range) {
+            continue;
+        }
+        let replace = match best {
+            None => true,
+            Some(current) => is_greater_pkgx_version(version, current),
+        };
+        if replace {
+            best = Some(*version);
+        }
+    }
+    best
+}
+
+/// Highest version by pkgx ordering. Versions without a numeric core sort
+/// below versions with one.
+fn max_pkgx_version<'a>(version_strings: &[&'a str]) -> Option<&'a str> {
+    let mut best: Option<&'a str> = None;
+    for version in version_strings {
+        let replace = match best {
+            None => true,
+            Some(current) => is_greater_pkgx_version(version, current),
+        };
+        if replace {
+            best = Some(*version);
+        }
+    }
+    best
+}
+
+fn is_greater_pkgx_version(candidate: &str, current: &str) -> bool {
+    match (parse_pkgx_version(candidate), parse_pkgx_version(current)) {
+        (Some(a), Some(b)) => a > b,
+        // Parseable versions outrank unparseable ones.
+        (Some(_), None) => true,
+        _ => false,
+    }
+}
+
+/// Parse a pkgx version with semverator (the Rust port of pkgx's
+/// `libpkgx:utils/semver.ts`): numeric components of any length, with an
+/// optional single trailing lowercase letter (`a`=1 … `z`=26) as an extra
+/// component, so `1.1.1w` is `[1, 1, 1, 23]`. Ordering (including prerelease,
+/// build, and calver handling) comes from its `Ord` impl.
+fn parse_pkgx_version(version: &str) -> Option<PkgxVersion> {
+    // semverator strips a lowercase `v` itself; also tolerate surrounding
+    // whitespace and an uppercase `V` for `versions.txt` robustness.
+    PkgxVersion::parse(version.trim().trim_start_matches(['v', 'V'])).ok()
 }
 
 async fn list_pkg_versions(name: &str) -> Result<Vec<VersionInfo>> {
@@ -1188,5 +1355,126 @@ dependencies:
         );
         assert_eq!(cmd_escape_value("a|b<c>d"), "a^|b^<c^>d");
         assert_eq!(cmd_escape_value("a^b"), "a^^b");
+    }
+
+    #[test]
+    fn coerces_openssl_letter_suffixes() {
+        assert_eq!(coerce_pkgx_version("1.1.1w"), Some("1.1.1".to_string()));
+        assert_eq!(coerce_pkgx_version("1.1.1a"), Some("1.1.1".to_string()));
+        assert_eq!(coerce_pkgx_version("v1.1.1w"), Some("1.1.1".to_string()));
+        assert_eq!(coerce_pkgx_version("1.1.1"), None);
+        assert_eq!(coerce_pkgx_version("3.0.12"), None);
+        // Prerelease-style suffixes with digits keep prerelease semantics.
+        assert_eq!(coerce_pkgx_version("3.12.0a1"), None);
+    }
+
+    #[test]
+    fn openssl_letter_versions_satisfy_caret_range() {
+        let range = parse_requirement_range("openssl.org", "^1.0.1").unwrap();
+        assert!(semver_satisfies("1.1.1w", &range));
+        assert!(semver_satisfies("1.1.1a", &range));
+        assert!(semver_satisfies("1.1.1", &range));
+        assert!(semver_satisfies("v1.1.1w", &range));
+        assert!(!semver_satisfies("3.0.12", &range));
+        assert!(version_satisfies_requirement("1.1.1w", "^1.0.1").unwrap());
+    }
+
+    #[test]
+    fn coerces_letter_suffix_in_requirement() {
+        assert_eq!(coerce_requirement_versions(">=1.1.1q"), ">=1.1.1");
+        assert_eq!(coerce_requirement_versions("^1.0.1"), "^1.0.1");
+        assert_eq!(coerce_requirement_versions(">=3.12.0a1"), ">=3.12.0a1");
+        parse_requirement_range("openssl.org", ">=1.1.1q").unwrap();
+    }
+
+    #[test]
+    fn coerced_letter_bound_accepts_coerced_version() {
+        // `<=1.1.1q` must not parse as a prerelease bound (which the
+        // coerced release `1.1.1` would exceed); coercion applies to bounds
+        // too. Same-base letters collapse, so `1.1.1s` also satisfies.
+        let range = parse_requirement_range("openssl.org", "<=1.1.1q").unwrap();
+        assert!(semver_satisfies("1.1.1q", &range));
+        assert!(semver_satisfies("1.1.1s", &range));
+    }
+
+    #[test]
+    fn pkgx_version_key_maps_trailing_letter() {
+        // semverator parses `1.1.1q` as components `[1, 1, 1, 17]`.
+        assert_eq!(
+            parse_pkgx_version("1.1.1w").unwrap().components,
+            vec![1, 1, 1, 23]
+        );
+        assert_eq!(
+            parse_pkgx_version("1.1.1q").unwrap().components,
+            vec![1, 1, 1, 17]
+        );
+        assert_eq!(
+            parse_pkgx_version("v1.1.1w").unwrap().components,
+            vec![1, 1, 1, 23]
+        );
+        // Uppercase `V` is tolerated by our wrapper, not by the library.
+        assert_eq!(
+            parse_pkgx_version("V1.1.1w").unwrap().components,
+            vec![1, 1, 1, 23]
+        );
+        assert_eq!(parse_pkgx_version("1.1").unwrap().components, vec![1, 1]);
+        assert_eq!(
+            parse_pkgx_version("1.1.1").unwrap().components,
+            vec![1, 1, 1]
+        );
+        assert!(parse_pkgx_version("latest").is_none());
+        assert!(parse_pkgx_version("").is_none());
+        // Only a single trailing lowercase letter carries ordering,
+        // matching semverator's `([a-z])?`.
+        assert!(parse_pkgx_version("1.1.1W").is_none());
+        assert!(parse_pkgx_version("1.1.1ab").is_none());
+        assert!(parse_pkgx_version("3.12.0a1").is_none());
+    }
+
+    #[test]
+    fn compares_pkgx_versions_like_semverator() {
+        use std::cmp::Ordering;
+        let cmp = |a: &str, b: &str| {
+            parse_pkgx_version(a)
+                .unwrap()
+                .cmp(&parse_pkgx_version(b).unwrap())
+        };
+        assert_eq!(cmp("1.1.1q", "1.1.1w"), Ordering::Less);
+        assert_eq!(cmp("1.1.1w", "1.1.1q"), Ordering::Greater);
+        assert_eq!(cmp("1.1.1", "1.1.1a"), Ordering::Less);
+        assert_eq!(cmp("1.1", "1.1.0"), Ordering::Equal);
+        assert_eq!(cmp("3.0.9", "3.0.10"), Ordering::Less);
+        assert_eq!(cmp("1.2.3-alpha", "1.2.3"), Ordering::Less);
+        assert_eq!(cmp("1.2.3-alpha.1", "1.2.3-alpha.2"), Ordering::Less);
+    }
+
+    #[test]
+    fn selects_highest_satisfying_version_by_pkgx_order() {
+        let range = parse_requirement_range("openssl.org", "^1.0.1").unwrap();
+        // Deliberately unsorted: the winner must not depend on list position.
+        let versions = [
+            "1.1.1w", "3.0.12", "1.1.1s", "1.1.1u", "3.0.0", "1.1.1v", "1.1.1t",
+        ];
+        assert_eq!(max_satisfying_version(&versions, &range), Some("1.1.1w"));
+        let reversed: Vec<&str> = versions.iter().rev().copied().collect();
+        assert_eq!(max_satisfying_version(&reversed, &range), Some("1.1.1w"));
+        assert_eq!(max_satisfying_version(&["3.0.12", "3.1.0"], &range), None);
+    }
+
+    #[test]
+    fn selects_latest_by_pkgx_order() {
+        assert_eq!(
+            max_pkgx_version(&["1.1.1w", "1.1.1s", "3.0.0"]),
+            Some("3.0.0")
+        );
+        assert_eq!(
+            max_pkgx_version(&["1.1.1s", "1.1.1w", "1.1.1v"]),
+            Some("1.1.1w")
+        );
+        assert_eq!(
+            max_pkgx_version(&["3.0.9", "3.0.10", "3.0.8"]),
+            Some("3.0.10")
+        );
+        assert_eq!(max_pkgx_version(&[] as &[&str]), None);
     }
 }
